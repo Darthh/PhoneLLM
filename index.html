@@ -1,0 +1,120 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PhoneLLM</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100dvh; display: flex; flex-direction: column;
+         font: 16px/1.5 system-ui, sans-serif; background: #14161a; color: #e8e8e8; }
+  header { display: flex; gap: 8px; padding: 8px; background: #1c1f24; }
+  select, button, textarea { font: inherit; background: #24282e; color: inherit;
+         border: 1px solid #363b43; border-radius: 8px; padding: 8px; }
+  select { flex: 1; min-width: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { white-space: pre-wrap; word-wrap: break-word; padding: 10px 12px; border-radius: 12px; max-width: 90%; }
+  .user { background: #2f5fa8; align-self: flex-end; }
+  .assistant { background: #24282e; align-self: flex-start; }
+  .err { background: #6b2020; align-self: center; font-size: 14px; }
+  form { display: flex; gap: 8px; padding: 8px; padding-bottom: max(8px, env(safe-area-inset-bottom));
+         background: #1c1f24; }
+  textarea { flex: 1; resize: none; height: 44px; max-height: 40dvh; }
+</style>
+
+<header>
+  <select id="model"></select>
+  <button id="clear" type="button">Clear</button>
+</header>
+<div id="log"></div>
+<form id="form">
+  <textarea id="input" placeholder="Ask…" enterkeyhint="send"></textarea>
+  <button id="send">Send</button>
+</form>
+
+<script>
+const OLLAMA = '';   // same origin; serve.py proxies /api/* to Ollama
+const $ = id => document.getElementById(id);
+let history = [];
+
+const bubble = (cls, text = '') => {
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls;
+  el.textContent = text;
+  $('log').append(el);
+  $('log').scrollTop = $('log').scrollHeight;
+  return el;
+};
+
+// Ollama streams newline-delimited JSON; chunks split mid-line, so buffer the tail.
+async function* ndjson(response) {
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += value;
+    const lines = buf.split('\n');
+    buf = lines.pop();                       // last element is the incomplete tail
+    for (const l of lines) if (l.trim()) yield JSON.parse(l);
+  }
+  if (buf.trim()) yield JSON.parse(buf);
+}
+
+fetch(`${OLLAMA}/api/tags`)
+  .then(r => r.json())
+  .then(({ models }) => {
+    $('model').innerHTML = models.map(m => `<option>${m.name}</option>`).join('');
+    $('model').value = localStorage.model || models[0]?.name;
+  })
+  .catch(e => bubble('err', `Can't load models — is Ollama running? (${e.message})`));
+
+$('model').onchange = () => localStorage.model = $('model').value;
+$('clear').onclick = () => { history = []; $('log').innerHTML = ''; };
+
+$('input').onkeydown = e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('form').requestSubmit(); }
+};
+
+$('form').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('input').value.trim();
+  if (!text || $('send').disabled) return;
+  $('input').value = '';
+  $('send').disabled = true;
+  history.push({ role: 'user', content: text });
+  bubble('user', text);
+  const out = bubble('assistant', '…');
+  let reply = '';
+  try {
+    const res = await fetch(`${OLLAMA}/api/chat`, {
+      method: 'POST',
+      body: JSON.stringify({ model: $('model').value, messages: history, stream: true }),
+    });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    for await (const chunk of ndjson(res)) {
+      reply += chunk.message?.content ?? '';
+      out.textContent = reply;
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+    history.push({ role: 'assistant', content: reply });
+  } catch (err) {
+    out.remove();
+    history.pop();
+    bubble('err', err.message);
+  }
+  $('send').disabled = false;
+  $('input').focus();
+};
+
+// #selftest -> check the stream parser survives a mid-line chunk split
+if (location.hash === '#selftest') (async () => {
+  const parts = ['{"message":{"content":"he', 'llo"}}\n{"message":{"con', 'tent":" world"}}\n'];
+  const body = new ReadableStream({ start(c) {
+    parts.forEach(p => c.enqueue(new TextEncoder().encode(p))); c.close();
+  }});
+  let s = '';
+  for await (const c of ndjson({ body })) s += c.message.content;
+  console.assert(s === 'hello world', 'ndjson split failed:', s);
+  bubble('err', s === 'hello world' ? 'selftest OK' : 'selftest FAILED: ' + s);
+})();
+</script>
